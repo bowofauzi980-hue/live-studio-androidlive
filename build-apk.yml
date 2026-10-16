@@ -1,0 +1,464 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil repositori
+        uses: actions/checkout@v4
+
+      - name: Buat file proyek Live Studio
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/livestudio/app app/src/main/res/layout app/src/main/res/values
+          cat > build.gradle.kts <<'LS_EOF_MARK'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+          }
+          LS_EOF_MARK
+          cat > settings.gradle.kts <<'LS_EOF_MARK'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://jitpack.io") }
+              }
+          }
+
+          rootProject.name = "LiveStudio"
+          include(":app")
+          LS_EOF_MARK
+          cat > gradle.properties <<'LS_EOF_MARK'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          LS_EOF_MARK
+          cat > app/build.gradle.kts <<'LS_EOF_MARK'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.livestudio.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.livestudio.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  viewBinding = true
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+
+              // Library RTMP: memutar file video/audio lalu mengirimnya ke server RTMP
+              implementation("com.github.pedroSG94.RootEncoder:library:2.5.5")
+          }
+          LS_EOF_MARK
+          cat > app/src/main/AndroidManifest.xml <<'LS_EOF_MARK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.LiveStudio">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          LS_EOF_MARK
+          cat > app/src/main/java/com/livestudio/app/MainActivity.kt <<'LS_EOF_MARK'
+          package com.livestudio.app
+
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.view.WindowManager
+          import android.widget.ArrayAdapter
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import com.livestudio.app.databinding.ActivityMainBinding
+          import com.pedro.common.ConnectChecker
+          import com.pedro.library.rtmp.RtmpFromFile
+          import com.pedro.encoder.input.decoder.AudioDecoderInterface
+          import com.pedro.encoder.input.decoder.VideoDecoderInterface
+          import java.io.File
+          import kotlin.concurrent.thread
+
+          class MainActivity : AppCompatActivity(), ConnectChecker, VideoDecoderInterface, AudioDecoderInterface {
+
+              private lateinit var binding: ActivityMainBinding
+              private var rtmp: RtmpFromFile? = null
+              private var videoPath: String? = null
+              private var copying = false
+
+              private val bitrateLabels = listOf(
+                  "720p - 2.500 kbps (disarankan)",
+                  "480p - 1.200 kbps (hemat kuota)",
+                  "1080p - 4.500 kbps (butuh internet kencang)"
+              )
+              private val bitrateValues = listOf(2500 * 1024, 1200 * 1024, 4500 * 1024)
+
+              private val pickVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri != null) salinVideo(uri)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  binding = ActivityMainBinding.inflate(layoutInflater)
+                  setContentView(binding.root)
+
+                  binding.spBitrate.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_spinner_dropdown_item, bitrateLabels
+                  )
+
+                  binding.btnPilihVideo.setOnClickListener {
+                      if (rtmp?.isStreaming == true) {
+                          toast("Hentikan siaran dulu sebelum ganti file")
+                      } else {
+                          pickVideo.launch(arrayOf("video/*"))
+                      }
+                  }
+
+                  binding.btnMulai.setOnClickListener {
+                      if (rtmp?.isStreaming == true) berhenti() else mulai()
+                  }
+              }
+
+              /** Menyalin video pilihan ke cache aplikasi agar bisa dibaca lewat path file. */
+              private fun salinVideo(uri: Uri) {
+                  copying = true
+                  setStatus("Menyiapkan file video...")
+                  binding.btnMulai.isEnabled = false
+                  thread {
+                      try {
+                          val nama = namaFile(uri)
+                          val tujuan = File(cacheDir, "sumber_siaran.mp4")
+                          contentResolver.openInputStream(uri)?.use { input ->
+                              tujuan.outputStream().use { output -> input.copyTo(output) }
+                          } ?: throw IllegalStateException("File tidak bisa dibuka")
+                          videoPath = tujuan.absolutePath
+                          runOnUiThread {
+                              binding.tvNamaFile.text = nama
+                              setStatus("File siap. Isi stream key lalu klik MULAI.")
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { setStatus("Gagal membaca file: ${e.message}") }
+                      } finally {
+                          copying = false
+                          runOnUiThread { binding.btnMulai.isEnabled = true }
+                      }
+                  }
+              }
+
+              private fun namaFile(uri: Uri): String {
+                  contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (i >= 0 && c.moveToFirst()) return c.getString(i)
+                  }
+                  return "video.mp4"
+              }
+
+              private fun mulai() {
+                  if (copying) return toast("Tunggu, file sedang disiapkan")
+                  val path = videoPath ?: return toast("Pilih file video dulu")
+                  val key = binding.etStreamKey.text.toString().trim()
+                  if (key.isEmpty()) return toast("Isi stream key dulu")
+                  val server = binding.etServer.text.toString().trim().trimEnd('/')
+                  if (!server.startsWith("rtmp")) return toast("Alamat server harus diawali rtmp://")
+
+                  val bitrate = bitrateValues[binding.spBitrate.selectedItemPosition]
+                  val client = RtmpFromFile(this, this, this)
+                  rtmp = client
+
+                  val videoOk = client.prepareVideo(path, bitrate)
+                  val audioOk = client.prepareAudio(path, 128 * 1024)
+                  if (!videoOk) {
+                      setStatus("Gagal menyiapkan video. Pastikan file berformat MP4 (H.264).")
+                      return
+                  }
+                  if (!audioOk) {
+                      setStatus("Gagal menyiapkan audio. Pastikan file punya suara (AAC).")
+                      return
+                  }
+
+                  client.setLoopMode(binding.swLoop.isChecked)
+
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  setStatus("Menghubungkan ke YouTube...")
+                  client.startStream("$server/$key")
+                  binding.btnMulai.text = "BERHENTI"
+              }
+
+              private fun berhenti() {
+                  rtmp?.stopStream()
+                  window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  binding.btnMulai.text = "MULAI"
+                  setStatus("Siaran dihentikan")
+              }
+
+              private fun setStatus(text: String) {
+                  binding.tvStatus.text = "Status: $text"
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+              // ---- ConnectChecker ----
+              override fun onConnectionStarted(url: String) {}
+
+              override fun onConnectionSuccess() {
+                  runOnUiThread { setStatus("LIVE sedang berlangsung") }
+              }
+
+              override fun onConnectionFailed(reason: String) {
+                  runOnUiThread {
+                      rtmp?.stopStream()
+                      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                      binding.btnMulai.text = "MULAI"
+                      setStatus("Koneksi gagal: $reason")
+                  }
+              }
+
+              override fun onNewBitrate(bitrate: Long) {}
+
+              override fun onDisconnect() {
+                  runOnUiThread { setStatus("Terputus dari server") }
+              }
+
+              override fun onAuthError() {
+                  runOnUiThread { setStatus("Autentikasi gagal. Periksa stream key.") }
+              }
+
+              override fun onAuthSuccess() {}
+
+              // ---- Decoder (file selesai diputar) ----
+              override fun onVideoDecoderFinished() {
+                  runOnUiThread {
+                      rtmp?.stopStream()
+                      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                      binding.btnMulai.text = "MULAI"
+                      setStatus("Video selesai diputar, siaran berakhir")
+                  }
+              }
+
+              override fun onAudioDecoderFinished() {}
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  if (rtmp?.isStreaming == true) rtmp?.stopStream()
+              }
+          }
+          LS_EOF_MARK
+          cat > app/src/main/res/values/strings.xml <<'LS_EOF_MARK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Live Studio</string>
+          </resources>
+          LS_EOF_MARK
+          cat > app/src/main/res/values/themes.xml <<'LS_EOF_MARK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.LiveStudio" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+                  <item name="colorPrimary">#FF0000</item>
+                  <item name="colorOnPrimary">#FFFFFF</item>
+                  <item name="colorSecondary">#FF0000</item>
+                  <item name="android:statusBarColor">@android:color/black</item>
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          LS_EOF_MARK
+          cat > app/src/main/res/layout/activity_main.xml <<'LS_EOF_MARK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fillViewport="true">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="20dp">
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Live Studio"
+                      android:textColor="#FFFFFF"
+                      android:textSize="26sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginBottom="20dp"
+                      android:text="Siarkan file video ke YouTube Live"
+                      android:textColor="#AAAAAA"
+                      android:textSize="14sp" />
+
+                  <com.google.android.material.button.MaterialButton
+                      android:id="@+id/btnPilihVideo"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Pilih File Video"
+                      style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
+
+                  <TextView
+                      android:id="@+id/tvNamaFile"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="Belum ada file dipilih"
+                      android:textColor="#CCCCCC"
+                      android:textSize="13sp" />
+
+                  <com.google.android.material.textfield.TextInputLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="20dp"
+                      android:hint="Server RTMP"
+                      style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+                      <com.google.android.material.textfield.TextInputEditText
+                          android:id="@+id/etServer"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:inputType="textUri"
+                          android:text="rtmp://a.rtmp.youtube.com/live2"
+                          android:textColor="#FFFFFF" />
+                  </com.google.android.material.textfield.TextInputLayout>
+
+                  <com.google.android.material.textfield.TextInputLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:hint="Stream Key YouTube"
+                      app:endIconMode="password_toggle"
+                      style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+                      <com.google.android.material.textfield.TextInputEditText
+                          android:id="@+id/etStreamKey"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:inputType="textPassword"
+                          android:textColor="#FFFFFF" />
+                  </com.google.android.material.textfield.TextInputLayout>
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="Kualitas video"
+                      android:textColor="#AAAAAA"
+                      android:textSize="13sp" />
+
+                  <Spinner
+                      android:id="@+id/spBitrate"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content" />
+
+                  <com.google.android.material.switchmaterial.SwitchMaterial
+                      android:id="@+id/swLoop"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:checked="true"
+                      android:text="Ulangi video terus-menerus (loop)"
+                      android:textColor="#FFFFFF" />
+
+                  <TextView
+                      android:id="@+id/tvStatus"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="20dp"
+                      android:text="Status: siap"
+                      android:textColor="#FFFFFF"
+                      android:textSize="15sp" />
+
+                  <com.google.android.material.button.MaterialButton
+                      android:id="@+id/btnMulai"
+                      android:layout_width="match_parent"
+                      android:layout_height="60dp"
+                      android:layout_marginTop="16dp"
+                      android:text="MULAI"
+                      android:textSize="18sp"
+                      android:textStyle="bold" />
+
+              </LinearLayout>
+          </ScrollView>
+          LS_EOF_MARK
+
+      - name: Pasang Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Pasang Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build APK debug
+        run: gradle assembleDebug --no-daemon
+
+      - name: Simpan APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveStudio-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
